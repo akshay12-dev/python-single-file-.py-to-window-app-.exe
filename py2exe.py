@@ -8,8 +8,13 @@ import subprocess
 import sys
 import threading
 import time
+
+# Third-party imports
 import tkinter as tk
+
+# Local imports
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 
 APP_TITLE = "Python → EXE Builder"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".py2exe_builder.json")
@@ -41,10 +46,17 @@ def find_python():
         cand = os.path.join(os.path.dirname(exe), "python.exe")
         if os.path.isfile(cand):
             return cand
+        # pythonw has no usable stdout; look for a console interpreter on PATH.
+        for name in ("python", "python3", "py"):
+            p = shutil.which(name)
+            if p:
+                return p
+        return ""
     return exe
 
 
 def top_level_imports(path):
+    """Return the set of top-level module names imported by a Python file."""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         tree = ast.parse(f.read(), path)
     mods = set()
@@ -58,15 +70,19 @@ def top_level_imports(path):
 
 
 def run_quiet(cmd, timeout=60):
+    """Run a command quietly and return (returncode, output)."""
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=timeout, creationflags=NO_WINDOW)
         return r.returncode, (r.stdout or "") + (r.stderr or "")
-    except Exception as e:  # noqa: BLE001
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError) as e:
         return -1, str(e)
+    except Exception as e:  # noqa: BLE001
+        return -1, f"Unexpected error: {e}"
 
 
 def classify(line):
+    """Classify a log line for colour coding: error, warn, ok, or plain."""
     low = line.lower()
     if "error" in low or "traceback" in low or "failed" in low:
         return "error"
@@ -78,6 +94,7 @@ def classify(line):
 
 
 def diagnose(text):
+    """Return human-readable hints for common PyInstaller failures."""
     hints = []
     t = text.lower()
     if "no module named pyinstaller" in t:
@@ -100,6 +117,7 @@ def diagnose(text):
 
 
 def open_path(path):
+    """Open a file or directory with the system's default application."""
     try:
         if os.name == "nt":
             os.startfile(path)  # type: ignore[attr-defined]
@@ -107,19 +125,95 @@ def open_path(path):
             subprocess.Popen(["open", path])
         else:
             subprocess.Popen(["xdg-open", path])
-    except Exception as e:  # noqa: BLE001
+    except (OSError, PermissionError, subprocess.SubprocessError) as e:
         messagebox.showerror("Open failed", str(e))
+    except Exception as e:  # noqa: BLE001
+        messagebox.showerror("Open failed", f"Unexpected error: {e}")
+
+
+def enable_high_dpi():
+    """Make the Tk UI crisp and DPI-aware on Windows.
+
+    Prefers per-monitor v2 awareness so the app can react when it is moved
+    between displays with different scaling, then falls back to older APIs.
+    Without this, Windows bitmap-scales the whole window and text looks blurry.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+    except Exception:  # noqa: BLE001
+        return
+
+    # Windows 10 1703+: per-monitor DPI awareness v2.
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    # Windows 8.1+: per-monitor awareness.
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    # Windows 8.1+: system awareness.
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    # Windows Vista+ fallback.
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def get_window_dpi(root):
+    """Return the DPI of the display the window is currently on."""
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            dpi = ctypes.windll.user32.GetDpiForWindow(root.winfo_id())
+            if dpi:
+                return float(dpi)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return float(root.winfo_fpixels("1i"))
+    except tk.TclError:
+        return 96.0
+
+
+def apply_tk_scaling(root):
+    """Match Tk font scaling to the real display DPI (call after Tk() exists)."""
+    dpi = get_window_dpi(root)
+    try:
+        root.tk.call("tk", "scaling", dpi / 72.0)
+    except tk.TclError:
+        pass
+    # Let the App scale its fixed geometry so the layout keeps its logical size.
+    root.ui_scale = max(1.0, dpi / 96.0)
+    return root.ui_scale
 
 
 # ----------------------------------------------------------------------------
 # Application
 # ----------------------------------------------------------------------------
 class App:
+    BASE_WIDTH = 900
+    BASE_HEIGHT = 780
+    BASE_MIN_WIDTH = 780
+    BASE_MIN_HEIGHT = 660
+
     def __init__(self, root):
         self.root = root
         root.title(APP_TITLE)
-        root.geometry("900x780")
-        root.minsize(780, 660)
+        self.ui_scale = getattr(root, "ui_scale", 1.0)
+        self.dpi_job = None
+        self.apply_ui_scale(self.ui_scale)
 
         self.q = queue.Queue()
         self.proc = None
@@ -130,6 +224,7 @@ class App:
         self.last_exe = ""
         self.last_outdir = ""
         self.build_after_install = False
+        self.preview_job = None
 
         self.script = tk.StringVar()
         self.name = tk.StringVar()
@@ -138,23 +233,77 @@ class App:
         self.interp = tk.StringVar(value=find_python())
         self.onefile = tk.BooleanVar(value=True)
         self.windowed = tk.BooleanVar(value=False)
-        self.clean = tk.BooleanVar(value=True)
+        self.clean_build = tk.BooleanVar(value=True)
         self.admin = tk.BooleanVar(value=False)
         self.hidden = tk.StringVar()
         self.extra = tk.StringVar()
-        self.preview = tk.StringVar()
+        self.command_preview = tk.StringVar()
         self.status = tk.StringVar(value="Ready")
 
         self.load_settings()
         self.build_ui()
         for v in (self.script, self.name, self.outdir, self.icon, self.interp, self.onefile,
-                  self.windowed, self.clean, self.admin, self.hidden, self.extra):
-            v.trace_add("write", lambda *_: self.update_preview())
+                  self.windowed, self.clean_build, self.admin, self.hidden, self.extra):
+            v.trace_add("write", lambda *_: self.schedule_preview())
         self.update_preview()
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(80, self.poll)
         root.after(300, lambda: self.start_check(silent=True))
+        root.after(1000, self.watch_dpi)
+
+    # --------------------------------------------------------------- DPI/scale
+    def apply_ui_scale(self, scale):
+        """Apply DPI scale to Tk fonts and size the window without exceeding the screen."""
+        self.ui_scale = max(1.0, scale)
+        try:
+            self.root.tk.call("tk", "scaling", (self.ui_scale * 96.0) / 72.0)
+        except tk.TclError:
+            pass
+        if hasattr(self, "log"):
+            self.refresh_fonts()
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win_w = min(int(self.BASE_WIDTH * self.ui_scale), int(screen_w * 0.95))
+        win_h = min(int(self.BASE_HEIGHT * self.ui_scale), int(screen_h * 0.90))
+        min_w = min(int(self.BASE_MIN_WIDTH * self.ui_scale), int(screen_w * 0.80))
+        min_h = min(int(self.BASE_MIN_HEIGHT * self.ui_scale), int(screen_h * 0.70))
+        try:
+            self.root.geometry(f"{win_w}x{win_h}")
+            self.root.minsize(min_w, min_h)
+        except tk.TclError:
+            pass
+
+    def refresh_fonts(self):
+        """Force existing fonts to re-resolve after a DPI/scaling change."""
+        try:
+            for name in tkfont.names(self.root):
+                try:
+                    f = tkfont.nametofont(name, root=self.root)
+                    f.configure(size=f.cget("size"))
+                except tk.TclError:
+                    pass
+        except tk.TclError:
+            pass
+        # Explicit fonts that are not driven by a named font.
+        try:
+            ttk.Style().configure("Build.TButton", font=("Segoe UI", 11, "bold"), padding=6)
+            self.log.configure(font=("Consolas", 9))
+        except (tk.TclError, AttributeError):
+            pass
+
+    def watch_dpi(self):
+        """Poll the window DPI and re-scale automatically when it changes."""
+        try:
+            scale = max(1.0, get_window_dpi(self.root) / 96.0)
+            if abs(scale - self.ui_scale) > 0.02:
+                self.apply_ui_scale(scale)
+        except tk.TclError:
+            return
+        try:
+            self.dpi_job = self.root.after(1000, self.watch_dpi)
+        except tk.TclError:
+            pass
 
     # ------------------------------------------------------------------ UI
     def build_ui(self):
@@ -184,7 +333,7 @@ class App:
         opts.grid(row=4, column=0, columnspan=3, sticky="ew", **pad)
         ttk.Checkbutton(opts, text="Single file (--onefile)", variable=self.onefile).grid(row=0, column=0, sticky="w", padx=8, pady=3)
         ttk.Checkbutton(opts, text="No console window (--windowed) – for GUI apps", variable=self.windowed).grid(row=0, column=1, sticky="w", padx=8, pady=3)
-        ttk.Checkbutton(opts, text="Clean build cache (--clean)", variable=self.clean).grid(row=1, column=0, sticky="w", padx=8, pady=3)
+        ttk.Checkbutton(opts, text="Clean build cache (--clean)", variable=self.clean_build).grid(row=1, column=0, sticky="w", padx=8, pady=3)
         ttk.Checkbutton(opts, text="Request admin rights (--uac-admin)", variable=self.admin).grid(row=1, column=1, sticky="w", padx=8, pady=3)
 
         # ---- Advanced tab
@@ -211,7 +360,7 @@ class App:
         # ---- Command preview
         pf = ttk.LabelFrame(self.root, text="Command preview")
         pf.pack(fill="x", padx=8, pady=6)
-        pe = ttk.Entry(pf, textvariable=self.preview, state="readonly")
+        pe = ttk.Entry(pf, textvariable=self.command_preview, state="readonly")
         pe.pack(side="left", fill="x", expand=True, padx=6, pady=6)
         ttk.Button(pf, text="Copy", width=7, command=self.copy_preview).pack(side="right", padx=6)
 
@@ -264,8 +413,7 @@ class App:
 
     def _row_entry(self, parent, row, label, var, cmd, btn_text, hint=None):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=4)
-        e = ttk.Entry(parent, textvariable=var)
-        e.grid(row=row, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky="ew", padx=4, pady=4)
         if cmd:
             ttk.Button(parent, text=btn_text, command=cmd, width=10).grid(row=row, column=2, padx=8)
         elif hint:
@@ -309,13 +457,18 @@ class App:
         self.refresh_data_list()
 
     def refresh_data_list(self):
+        """Rebuild the add-data listbox from the current data list."""
         self.data_list.delete(0, tk.END)
         for s, d in self.data:
             self.data_list.insert(tk.END, f"{s}   →   {d}")
-        self.update_preview()
+        self.schedule_preview()
 
     # --------------------------------------------------------- Build command
     def build_spec(self):
+        """Build the PyInstaller command and return (cmd, cwd, exe_path, out_dir).
+
+        Raises ValueError with a user-facing message if any input is invalid.
+        """
         script = self.script.get().strip().strip('"')
         if not script:
             raise ValueError("Select a Python file.")
@@ -325,13 +478,19 @@ class App:
         cwd = os.path.dirname(script)
         stem = os.path.splitext(os.path.basename(script))[0]
         name = self.name.get().strip() or stem
-        outdir = os.path.abspath(self.outdir.get().strip() or os.path.join(cwd, "dist"))
+        raw_out = self.outdir.get().strip()
+        if raw_out:
+            # Relative output folders are resolved next to the script, not the CWD.
+            outdir = raw_out if os.path.isabs(raw_out) else os.path.join(cwd, raw_out)
+            outdir = os.path.abspath(outdir)
+        else:
+            outdir = os.path.abspath(os.path.join(cwd, "dist"))
         py = self.interp.get().strip() or find_python()
         if not py:
             raise ValueError("No Python interpreter found. Set one under Advanced.")
 
         cmd = [py, "-m", "PyInstaller", "--noconfirm"]
-        if self.clean.get():
+        if self.clean_build.get():
             cmd.append("--clean")
         cmd.append("--onefile" if self.onefile.get() else "--onedir")
         cmd.append("--windowed" if self.windowed.get() else "--console")
@@ -345,9 +504,13 @@ class App:
             cmd += ["--icon", icon]
         if self.admin.get():
             cmd.append("--uac-admin")
-        for h in self.hidden.get().replace(";", ",").replace(" ", ",").split(","):
-            if h.strip():
-                cmd += ["--hidden-import", h.strip()]
+        # Parse hidden imports, handling multiple separators and whitespace
+        if self.hidden.get():
+            imports = self.hidden.get().replace(";", ",").replace(" ", ",")
+            for h in imports.split(","):
+                h = h.strip()
+                if h:
+                    cmd += ["--hidden-import", h]
         for s, d in self.data:
             cmd += ["--add-data", f"{s}{os.pathsep}{d}"]
         extra = self.extra.get().strip()
@@ -359,34 +522,62 @@ class App:
             else os.path.join(outdir, name, name + EXE_EXT)
         return cmd, cwd, exe, outdir
 
+    def schedule_preview(self):
+        """Debounce preview recomputation so typing does not do repeated I/O."""
+        if self.preview_job is not None:
+            try:
+                self.root.after_cancel(self.preview_job)
+            except tk.TclError:
+                pass
+        self.preview_job = self.root.after(150, self.update_preview)
+
     def update_preview(self):
+        """Update the command preview display, cancelling any pending debounce."""
+        if self.preview_job is not None:
+            try:
+                self.root.after_cancel(self.preview_job)
+            except tk.TclError:
+                pass
+            self.preview_job = None
         try:
             cmd = self.build_spec()[0]
-            self.preview.set(subprocess.list2cmdline(cmd))
+            self.command_preview.set(subprocess.list2cmdline(cmd))
         except ValueError as e:
-            self.preview.set("(" + str(e).splitlines()[0] + ")")
+            self.command_preview.set("(" + str(e).splitlines()[0] + ")")
 
     def copy_preview(self):
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.preview.get())
-        self.status.set("Command copied to clipboard")
+        """Copy the preview command to clipboard."""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.command_preview.get())
+            self.status.set("Command copied to clipboard")
+        except tk.TclError as e:
+            messagebox.showerror("Copy failed", str(e))
 
     # ------------------------------------------------------------- Logging
     def write(self, text, tag="plain"):
+        """Write text to the log with specified formatting tag."""
         self.log.insert(tk.END, text, tag)
         self.log.see(tk.END)
 
     def say(self, text, tag="info"):
+        """Queue text to be written to log with specified formatting tag."""
         self.q.put(("log", text, tag))
 
     def save_log(self):
+        """Save current log contents to a text file."""
         f = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text", "*.txt")])
-        if f:
+        if not f:
+            return
+        try:
             with open(f, "w", encoding="utf-8") as fh:
                 fh.write(self.log.get("1.0", tk.END))
+        except (OSError, PermissionError) as e:
+            messagebox.showerror("Save failed", str(e))
 
     # ------------------------------------------------------ Process control
     def set_running(self, flag, status=None):
+        """Toggle UI into/out of the running state and optionally set the status text."""
         self.running = flag
         st = "disabled" if flag else "normal"
         for b in (self.btn_build, self.btn_check, self.btn_install, self.btn_scan):
@@ -400,12 +591,19 @@ class App:
             self.status.set(status)
 
     def stream(self, cmd, cwd=None):
+        """Stream output from a subprocess and capture it for logging."""
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
         self.proc = subprocess.Popen(
             cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace", creationflags=NO_WINDOW, env=env)
+        max_buffer_size = 10000  # Prevent excessive memory usage for large builds
         for line in self.proc.stdout:
             self.buf.append(line)
+            # Maintain buffer size limit
+            if len(self.buf) > max_buffer_size:
+                # Keep last 80% of buffer to preserve recent output for diagnostics
+                keep_count = int(max_buffer_size * 0.8)
+                self.buf = self.buf[-keep_count:]
             self.q.put(("log", line, classify(line)))
         return self.proc.wait()
 
@@ -419,16 +617,20 @@ class App:
                                    capture_output=True, creationflags=NO_WINDOW)
                 else:
                     p.terminate()
+            except (OSError, PermissionError):  # noqa: BLE001
+                pass
             except Exception:  # noqa: BLE001
                 pass
 
     def begin(self, status):
+        """Reset cancel/buffer state and enter the running UI state."""
         self.cancelled = False
         self.buf = []
         self.set_running(True, status)
 
     # --------------------------------------------------------------- Actions
     def start_build(self):
+        """Validate inputs and start a build on a background thread."""
         try:
             cmd, cwd, exe, outdir = self.build_spec()
         except ValueError as e:
@@ -439,6 +641,7 @@ class App:
         threading.Thread(target=self.build_worker, args=(cmd, cwd, exe, outdir), daemon=True).start()
 
     def build_worker(self, cmd, cwd, exe, outdir):
+        """Run PyInstaller, stream the log, verify the EXE, and report hints on failure."""
         ok = False
         t0 = time.time()
         try:
@@ -470,18 +673,22 @@ class App:
                         self.say("  • " + h + "\n", "warn")
         except FileNotFoundError:
             self.say("\nInterpreter not found:\n  " + cmd[0] + "\nPick a valid python.exe under Advanced.\n", "error")
+        except (OSError, PermissionError, subprocess.SubprocessError) as e:
+            self.say(f"\nBuild error: {e}\n", "error")
         except Exception as e:  # noqa: BLE001
             self.say(f"\nUnexpected error: {e}\n", "error")
         finally:
             self.q.put(("done", ("build", ok, exe, outdir), None))
 
     def start_check(self, silent=False):
+        """Check Python + PyInstaller availability; silent hides the status message."""
         if self.running:
             return
-        self.begin("Checking setup…")
+        self.begin("" if silent else "Checking setup…")
         threading.Thread(target=self.check_worker, args=(silent,), daemon=True).start()
 
     def check_worker(self, silent):
+        """Report the interpreter and PyInstaller versions for the selected Python."""
         py = self.interp.get().strip() or find_python()
         try:
             rc, out = run_quiet([py, "-c",
@@ -496,14 +703,18 @@ class App:
             else:
                 self.say(f"Python {pyv} found, but PyInstaller is NOT installed for it.\n"
                          "→ Click 'Install / Update PyInstaller'.\n", "warn")
+        except Exception as e:  # noqa: BLE001
+            self.say(f"Setup check failed: {e}\n", "error")
         finally:
             self.q.put(("done", ("check", True, "", ""), None))
 
     def start_install(self):
+        """Install/upgrade PyInstaller for the selected interpreter."""
         self.begin("Installing PyInstaller…")
         threading.Thread(target=self.install_worker, daemon=True).start()
 
     def install_worker(self):
+        """Run pip install --upgrade pyinstaller and report the result."""
         ok = False
         py = self.interp.get().strip() or find_python()
         cmd = [py, "-m", "pip", "install", "--upgrade", "pyinstaller"]
@@ -513,12 +724,15 @@ class App:
             ok = rc == 0 and not self.cancelled
             self.say("\n✔ PyInstaller ready.\n" if ok else f"\n✘ pip failed (exit code {rc}).\n",
                      "ok" if ok else "error")
-        except Exception as e:  # noqa: BLE001
+        except (OSError, PermissionError) as e:
             self.say(f"\nInstall error: {e}\n", "error")
+        except Exception as e:  # noqa: BLE001
+            self.say(f"\nUnexpected install error: {e}\n", "error")
         finally:
             self.q.put(("done", ("install", ok, "", ""), None))
 
     def start_scan(self):
+        """Validate the selected script and start an import scan on a thread."""
         try:
             script = os.path.abspath(self.script.get().strip().strip('"'))
             if not os.path.isfile(script):
@@ -553,28 +767,38 @@ class App:
                 self.say("✔ All imports can be resolved.\n", "ok")
         except SyntaxError as e:
             self.say(f"Syntax error in script – fix it before building: {e}\n", "error")
-        except Exception as e:  # noqa: BLE001
+        except (OSError, PermissionError, subprocess.SubprocessError) as e:
             self.say(f"Scan failed: {e}\n", "error")
+        except Exception as e:  # noqa: BLE001
+            self.say(f"Unexpected scan error: {e}\n", "error")
         finally:
             self.q.put(("done", ("scan", True, "", ""), None))
 
     # ---------------------------------------------------------- Post actions
     def open_output(self):
+        """Open the most recently built output folder."""
         if self.last_outdir and os.path.isdir(self.last_outdir):
             open_path(self.last_outdir)
 
     def run_exe(self):
+        """Launch the most recently built EXE for quick testing."""
         if self.last_exe and os.path.isfile(self.last_exe):
             try:
                 subprocess.Popen([self.last_exe], cwd=os.path.dirname(self.last_exe))
-            except Exception as e:  # noqa: BLE001
+            except (OSError, PermissionError, subprocess.SubprocessError) as e:
                 messagebox.showerror("Run failed", str(e))
+            except Exception as e:  # noqa: BLE001
+                messagebox.showerror("Run failed", f"Unexpected error: {e}")
 
     # ------------------------------------------------------ Queue (UI thread)
     def poll(self):
+        """Drain the worker queue on the UI thread, then reschedule."""
         try:
             while True:
-                kind, a, b = self.q.get_nowait()
+                try:
+                    kind, a, b = self.q.get_nowait()
+                except queue.Empty:
+                    break
                 if kind == "log":
                     self.write(a, b)
                 elif kind == "ask_install":
@@ -584,11 +808,12 @@ class App:
                         self.build_after_install = True
                 elif kind == "done":
                     self.on_done(*a)
-        except queue.Empty:
-            pass
-        self.root.after(80, self.poll)
+        finally:
+            # Always reschedule so a single bad event cannot freeze the log.
+            self.root.after(80, self.poll)
 
     def on_done(self, action, ok, exe, outdir):
+        """Handle a finished background task on the UI thread."""
         self.proc = None
         self.set_running(False)
         if action == "build":
@@ -617,37 +842,54 @@ class App:
 
     # --------------------------------------------------------------- Settings
     def load_settings(self):
+        """Load persisted options from the user's config file, ignoring failures."""
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 s = json.load(f)
             self.onefile.set(s.get("onefile", True))
             self.windowed.set(s.get("windowed", False))
-            self.clean.set(s.get("clean", True))
+            self.clean_build.set(s.get("clean", True))
             self.admin.set(s.get("admin", False))
             if s.get("interp") and os.path.isfile(s["interp"]):
                 self.interp.set(s["interp"])
-        except Exception:  # noqa: BLE001
+        except (json.JSONDecodeError, OSError, IOError):  # noqa: BLE001
             pass
 
     def save_settings(self):
+        """Persist current options to the user's config file, ignoring failures."""
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump({"onefile": self.onefile.get(), "windowed": self.windowed.get(),
-                           "clean": self.clean.get(), "admin": self.admin.get(),
+                           "clean": self.clean_build.get(), "admin": self.admin.get(),
                            "interp": self.interp.get()}, f, indent=2)
-        except Exception:  # noqa: BLE001
+        except (OSError, IOError, PermissionError):  # noqa: BLE001
             pass
 
     def on_close(self):
+        """Confirm quitting while a task runs, then save settings and close."""
         if self.running:
             if not messagebox.askyesno("Quit", "A task is still running. Stop it and quit?"):
                 return
             self.stop()
+        if self.preview_job is not None:
+            try:
+                self.root.after_cancel(self.preview_job)
+            except tk.TclError:
+                pass
+            self.preview_job = None
+        if self.dpi_job is not None:
+            try:
+                self.root.after_cancel(self.dpi_job)
+            except tk.TclError:
+                pass
+            self.dpi_job = None
         self.save_settings()
         self.root.destroy()
 
 
 if __name__ == "__main__":
+    enable_high_dpi()
     root = tk.Tk()
+    apply_tk_scaling(root)
     App(root)
     root.mainloop()
